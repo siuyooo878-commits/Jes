@@ -1,0 +1,321 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>White Paint to Carbon Fiber — Red Crack Transformation</title>
+<style>
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;height:100%;background:#06080b;color:#cfd6df;font:13px system-ui,sans-serif;overflow:hidden;touch-action:manipulation}
+#app{display:flex;flex-direction:column;align-items:center;height:100vh;height:100dvh;padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
+#stage{position:relative;height:min(calc(100dvh - 150px),177.78vw);aspect-ratio:9/16;background:#000;border-radius:10px;overflow:hidden;margin-top:4px}
+canvas{position:absolute;inset:0;width:100%;height:100%}
+#ld{position:absolute;inset:0;display:grid;place-items:center;text-align:center;padding:22px;background:#06080b;color:#f99;white-space:pre-wrap}
+#ui{width:min(100vw,640px);padding:6px 8px;display:flex;flex-direction:column;gap:5px}
+.r{display:flex;gap:5px;align-items:center;flex-wrap:wrap}
+button,select{background:#161b22;color:#d8dee6;border:1px solid #2a323d;border-radius:8px;min-height:36px;padding:0 10px;font:inherit}
+button.on{background:#3a1216;border-color:#d63535}
+#sc{flex:1;min-width:110px}
+</style>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/"}}</script>
+</head><body><div id="app">
+<div id="stage"><canvas id="gl"></canvas><div id="ld">Loading car model…</div></div>
+<div id="ui">
+<div class="r"><button id="pp">▶ Play</button><button id="rs">⟲</button><input id="sc" type="range" min="0" max="14" step="0.01" value="0"><span id="tm">0:00 / 0:14</span></div>
+<div class="r"><select id="ql"><option value="0">Quality: Low 540×960</option><option value="1" selected>Medium 720×1280</option><option value="2">High 1080×1920</option></select>
+<select id="rq"><option value="1080">Export 1080×1920</option><option value="540">Export 540×960</option></select><button id="ex">⬇ Export MP4</button><button id="rec">● Record (live)</button></div>
+<div class="r"><span id="st"></span></div>
+</div></div>
+<script type="module">
+import*as THREE from 'three';
+import{FBXLoader}from 'three/addons/loaders/FBXLoader.js';
+import{GLTFLoader}from 'three/addons/loaders/GLTFLoader.js';
+
+/* ================= settings you may want to edit ================= */
+const MODEL = new URLSearchParams(location.search).get('model') || 'FINAL_MODEL_AT.fbx'; // .fbx or .glb/.gltf, same folder as index.html
+const CAR_LENGTH = 4.63;      // metres, the model is normalised to this length
+const FLIP_CAR = false;       // set true if the nose/tail ends up the wrong way round (nose must be +Z)
+const DUR = 14, FPS = 30;
+const T0 = 1.5, T1 = 9.0;     // crack sweep starts / ends (seconds)
+// anything whose material name matches this is NOT repainted (glass, tyres, rims, interior, lights...)
+const KEEP = /glass|light|tyre|tire|rubber|rim|disc|brake|caliper|mirror|cabin|dashboard|leather|plastic|suede|stitch|grid|engine|gruid|interior|seat|logo|badge|chrome/i;
+
+/* ================= utils ================= */
+const $ = s => document.querySelector(s);
+const cl = (x, a, b) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const sstep = (a, b, x) => { const t = cl((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t) };
+const prog = t => { const u = cl((t - T0) / (T1 - T0), 0, 1); return .5 * u + .5 * u * u * (3 - 2 * u) };   // sweep progress 0..1
+const fmt = t => `0:${String(Math.floor(t)).padStart(2, '0')}`;
+const DG = { errors: [], mats: [] };
+function fail(e) { DG.errors.push(String(e && e.message || e)); $('#ld').style.display = 'grid'; $('#ld').textContent = 'Load error:\n' + DG.errors.join('\n') + '\n\nServe over HTTP (python3 -m http.server 8000) and put ' + MODEL + ' next to index.html.'; console.error(e) }
+
+/* shared shader uniforms (one object, every body material points at it) */
+const U = { uP: { value: 0 }, uT: { value: 0 }, uZ0: { value: 3.4 }, uZ1: { value: -3.3 } };
+
+/* ================= state ================= */
+let R, scene, cam, carG, mirG, fbxRoot, ready = false, T = 0, playing = false, last = performance.now(), exp = false, expCancel = false, recOn = false, mr, chunks = [], rc, rx, prevQ = 1;
+let redFront, redL, redR, floorGlow, lightMats = [], flakes, sparks, PD = [];
+const Q = [[540, 960], [720, 1280], [1080, 1920]];
+
+/* ================= measured envelope of the supplied car (z = -2.25..2.25 step .25) used to place flakes ================= */
+const TOP = [1.06,.97,.93,.9,.91,.97,1.05,1.09,1.14,1.15,1.15,1.12,1.07,.95,.81,.74,.66,.57,.43], HALF = [.67,.95,.99,.99,.99,1.03,1.03,1,.99,.98,.98,.98,.99,.99,.99,1,1.03,.99,.81];
+const tab = (A, z) => { const f = cl((z + 2.25) / .25, 0, A.length - 1.001), i = Math.floor(f); return lerp(A[i], A[i + 1], f - i) };
+
+/* ================= body shader: white clearcoat paint -> carbon twill, red crack front sweeping nose to tail ================= */
+const VHEAD = `#include <common>
+varying vec3 vWP; varying vec3 vWN;`;
+const VBODY = `#include <begin_vertex>
+vWP = (modelMatrix * vec4(transformed, 1.0)).xyz;
+vWN = normalize(mat3(modelMatrix) * objectNormal);`;
+const FHEAD = `#include <common>
+varying vec3 vWP; varying vec3 vWN;
+uniform float uP; uniform float uT; uniform float uZ0; uniform float uZ1;
+vec3 gEmis; float gCm; float gCarbonRough;
+float fxh(vec3 p){p=fract(p*0.3183099+.1);p*=17.0;return fract(p.x*p.y*p.z*(p.x+p.y+p.z));}
+float fxn(vec3 x){vec3 i=floor(x),f=fract(x);f=f*f*(3.0-2.0*f);
+ return mix(mix(mix(fxh(i),fxh(i+vec3(1,0,0)),f.x),mix(fxh(i+vec3(0,1,0)),fxh(i+vec3(1,1,0)),f.x),f.y),
+            mix(mix(fxh(i+vec3(0,0,1)),fxh(i+vec3(1,0,1)),f.x),mix(fxh(i+vec3(0,1,1)),fxh(i+vec3(1,1,1)),f.x),f.y),f.z);}
+float fxf(vec3 p){float a=.5,s=0.;for(int i=0;i<4;i++){s+=a*fxn(p);p=p*2.03+7.1;a*=.5;}return s;}`;
+const FCOLOR = `#include <color_fragment>
+{
+  vec3 wp = vWP;
+  float jag = fxf(wp*2.3)*0.55 + fxf(wp*9.0)*0.12;
+  float s = wp.z + 0.30*wp.y;                       // sweep coordinate: nose (+z) to tail (-z), slightly diagonal
+  float fz = mix(uZ0, uZ1, uP);                     // crack front position
+  float d = s - fz + (jag - 0.35)*0.5;              // d>0 : already carbon, d<0 : still white
+  float cm = smoothstep(-0.015, 0.015, d);
+  gCm = cm;
+  // carbon twill weave, world-space triplanar-ish mapping, faded when sub-pixel
+  vec3 an = abs(vWN);
+  vec2 uv = (an.y > an.x && an.y > an.z) ? wp.xz : ((an.x > an.z) ? wp.zy : wp.xy);
+  vec2 g = uv * 62.0;
+  float tw = step(2.0, mod(floor(g.x) + floor(g.y), 4.0));
+  vec2 fl = fract(g);
+  float fiber = (tw > 0.5) ? abs(sin(fl.x*3.14159*3.0)) : abs(sin(fl.y*3.14159*3.0));
+  float shade = mix(0.55, 1.0, fiber) * mix(0.78, 1.0, tw);
+  float fw = length(fwidth(g));
+  shade = mix(0.78, shade, 1.0 - smoothstep(0.35, 1.1, fw));
+  vec3 carbon = vec3(0.020, 0.022, 0.026) * (0.55 + shade);
+  gCarbonRough = mix(0.34, 0.16, fiber);
+  vec3 paint = vec3(0.90, 0.91, 0.93);
+  diffuseColor.rgb = mix(paint, carbon, cm);
+  // red crack: hot core, halo, web of hairline cracks ahead of the front, fading trail behind it
+  vec3 red = vec3(1.0, 0.05, 0.02);
+  float core = exp(-pow(d/0.016, 2.0));
+  float halo = exp(-pow(d/0.20, 2.0));
+  float r1 = 1.0 - smoothstep(0.0, 0.028, abs(fxf(wp*5.0 + 3.0) - 0.47));
+  float r2 = 1.0 - smoothstep(0.0, 0.020, abs(fxf(wp*11.0 + 9.0) - 0.47));
+  float ridge = max(r1, r2*0.8);
+  float web = ridge * (1.0 - cm) * smoothstep(-1.1, -0.02, d);
+  float trail = ridge * cm * exp(-max(d, 0.0)*2.6);
+  gEmis = red * (core*6.0 + halo*0.7 + web*3.2 + trail*2.0);
+}`;
+const FROUGH = `#include <roughnessmap_fragment>
+roughnessFactor = mix(0.12, gCarbonRough, gCm);`;
+const FMETAL = `#include <metalnessmap_fragment>
+metalnessFactor = mix(0.12, 0.3, gCm);`;
+const FEMIS = `#include <emissivemap_fragment>
+totalEmissiveRadiance += gEmis;`;
+
+function bodyMat(old) {
+  const m = new THREE.MeshPhysicalMaterial({ name: old.name, color: 0xffffff, roughness: .15, metalness: .15, clearcoat: 1, clearcoatRoughness: .04, envMapIntensity: 1.0, side: THREE.DoubleSide });
+  if (old.normalMap) m.normalMap = old.normalMap;
+  m.onBeforeCompile = sh => {
+    Object.assign(sh.uniforms, U);
+    sh.vertexShader = sh.vertexShader.replace('#include <common>', VHEAD).replace('#include <begin_vertex>', VBODY);
+    sh.fragmentShader = sh.fragmentShader.replace('#include <common>', FHEAD).replace('#include <color_fragment>', FCOLOR)
+      .replace('#include <roughnessmap_fragment>', FROUGH).replace('#include <metalnessmap_fragment>', FMETAL).replace('#include <emissivemap_fragment>', FEMIS);
+  };
+  m.customProgramCacheKey = () => 'whiteToCarbonCrack';
+  return m;
+}
+function keepMat(old) {
+  const n = old.name || '', s = new THREE.MeshStandardMaterial({ name: n, color: old.color || 0x222222, map: old.map, normalMap: old.normalMap, emissiveMap: old.emissiveMap, side: THREE.DoubleSide, roughness: .4, metalness: .5, envMapIntensity: 1 });
+  if (/glass/i.test(n) && !/light/i.test(n)) { s.transparent = true; s.opacity = .32; s.color.set(0x0a1016); s.metalness = .9; s.roughness = .05; s.depthWrite = false }
+  else if (/light/i.test(n)) { s.metalness = .2; s.roughness = .15; s.emissive = new THREE.Color(0xff1010); s.emissiveIntensity = 0; lightMats.push(s) }
+  else if (/tyre|tire|rubber/i.test(n)) { s.color.set(0x0b0b0c); s.metalness = 0; s.roughness = .8 }
+  else if (/rim|disc|brake|caliper|chrome/i.test(n)) { s.metalness = .95; s.roughness = .28 }
+  else if (/mirror/i.test(n)) { s.metalness = 1; s.roughness = .06 }
+  else { s.metalness = .1; s.roughness = .6; s.emissive = new THREE.Color(0xff1010); s.emissiveIntensity = 0; lightMats.push(s); s.userData.soft = true }
+  return s;
+}
+
+/* ================= scene ================= */
+function initScene() {
+  const gl = $('#gl');
+  R = new THREE.WebGLRenderer({ canvas: gl, antialias: true, powerPreference: 'high-performance' });
+  R.toneMapping = THREE.ACESFilmicToneMapping; R.toneMappingExposure = 1.0; R.outputColorSpace = THREE.SRGBColorSpace;
+  scene = new THREE.Scene();
+  cam = new THREE.PerspectiveCamera(36, 9 / 16, .1, 200);
+
+  // backdrop: dark vertical gradient
+  const bc = document.createElement('canvas'); bc.width = 4; bc.height = 256; const bx = bc.getContext('2d'), bg = bx.createLinearGradient(0, 0, 0, 256);
+  bg.addColorStop(0, '#3a3d43'); bg.addColorStop(.45, '#24272c'); bg.addColorStop(1, '#101215'); bx.fillStyle = bg; bx.fillRect(0, 0, 4, 256);
+  const bt = new THREE.CanvasTexture(bc); bt.colorSpace = THREE.SRGBColorSpace; scene.background = bt;
+
+  // studio environment (softboxes) for reflections
+  const es = new THREE.Scene(), dome = new THREE.Mesh(new THREE.SphereGeometry(30, 32, 16), new THREE.MeshBasicMaterial({ color: 0x0b0c0e, side: THREE.BackSide }));
+  es.add(dome);
+  const box = (w, h, x, y, z, rx_, ry_, k) => { const m = new THREE.Mesh(new THREE.PlaneGeometry(w, h), new THREE.MeshBasicMaterial({ color: new THREE.Color(k, k, k), side: THREE.DoubleSide })); m.position.set(x, y, z); m.rotation.set(rx_, ry_, 0); es.add(m) };
+  box(14, 9, 0, 11, 0, Math.PI / 2, 0, 5);          // big overhead softbox
+  box(2.2, 9, -9, 4, 2, 0, Math.PI / 2, 3.2);       // left strip
+  box(2.2, 9, 9, 4, 2, 0, Math.PI / 2, 3.2);        // right strip
+  box(10, 1.6, 0, 3, 11, 0, 0, 2.2);                // front fill strip
+  box(10, 1.2, 0, 1.2, -11, 0, 0, 1.4);             // rear low strip
+  const pm = new THREE.PMREMGenerator(R); scene.environment = pm.fromScene(es, .03).texture; pm.dispose();
+
+  // key light for shape on the paint
+  const key = new THREE.DirectionalLight(0xffffff, 1.2); key.position.set(-3, 6, 4); scene.add(key);
+
+  // car group + mirrored copy (reflection in the floor)
+  carG = new THREE.Group(); scene.add(carG);
+  mirG = new THREE.Group(); mirG.scale.y = -1; scene.add(mirG);
+
+  // floor: dark glossy plane with soft radial fade, drawn over the mirrored car
+  const fc = document.createElement('canvas'); fc.width = fc.height = 256; const fx = fc.getContext('2d'), fg = fx.createRadialGradient(128, 128, 10, 128, 128, 128);
+  fg.addColorStop(0, '#fff'); fg.addColorStop(.55, '#bbb'); fg.addColorStop(1, '#000'); fx.fillStyle = fg; fx.fillRect(0, 0, 256, 256);
+  const floor = new THREE.Mesh(new THREE.PlaneGeometry(40, 40), new THREE.MeshBasicMaterial({ color: 0x0e1013, transparent: true, opacity: .84, alphaMap: new THREE.CanvasTexture(fc), depthWrite: false }));
+  floor.rotation.x = -Math.PI / 2; floor.position.y = 0; floor.renderOrder = 2; scene.add(floor);
+
+  // contact shadow + red floor glow
+  const sc = document.createElement('canvas'); sc.width = sc.height = 128; const sx = sc.getContext('2d'), sg = sx.createRadialGradient(64, 64, 4, 64, 64, 62);
+  sg.addColorStop(0, 'rgba(0,0,0,.9)'); sg.addColorStop(1, 'rgba(0,0,0,0)'); sx.fillStyle = sg; sx.fillRect(0, 0, 128, 128);
+  const sh = new THREE.Mesh(new THREE.PlaneGeometry(3.2, 6.4), new THREE.MeshBasicMaterial({ map: new THREE.CanvasTexture(sc), transparent: true, opacity: .7, depthWrite: false }));
+  sh.rotation.x = -Math.PI / 2; sh.position.y = .015; sh.renderOrder = 3; scene.add(sh);
+  const gc = document.createElement('canvas'); gc.width = gc.height = 128; const gx = gc.getContext('2d'), gg = gx.createRadialGradient(64, 64, 2, 64, 64, 62);
+  gg.addColorStop(0, 'rgba(255,40,30,.9)'); gg.addColorStop(.5, 'rgba(255,20,10,.25)'); gg.addColorStop(1, 'rgba(255,0,0,0)'); gx.fillStyle = gg; gx.fillRect(0, 0, 128, 128);
+  floorGlow = new THREE.Mesh(new THREE.PlaneGeometry(6.5, 9.5), new THREE.MeshBasicMaterial({ map: new THREE.CanvasTexture(gc), transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false }));
+  floorGlow.rotation.x = -Math.PI / 2; floorGlow.position.y = .02; floorGlow.renderOrder = 4; scene.add(floorGlow);
+
+  // red lights: one rides the crack front, two settle as accent glow
+  redFront = new THREE.PointLight(0xff1a10, 0, 6, 2); scene.add(redFront);
+  redL = new THREE.PointLight(0xff1a10, 0, 6, 2); redL.position.set(-1.5, .5, 2.0); scene.add(redL);
+  redR = new THREE.PointLight(0xff1a10, 0, 6, 2); redR.position.set(1.5, .5, 2.0); scene.add(redR);
+
+  // flakes + sparks
+  const N = 700, rnd = (() => { let q = 12345; return () => (q = (q * 16807) % 2147483647) / 2147483647 })();
+  for (let i = 0; i < N; i++) {
+    const z = (rnd() - .5) * 4.4, top = rnd() < .55; let x, y;
+    if (top) { x = (rnd() * 2 - 1) * tab(HALF, z) * .8; y = tab(TOP, z) * (.55 + .45 * rnd()) } else { x = (rnd() < .5 ? -1 : 1) * tab(HALF, z); y = .25 + rnd() * .7 }
+    const sC = z + .3 * y, u = cl((U.uZ0.value - sC) / (U.uZ0.value - U.uZ1.value), 0, 1);
+    let a = 0, b = 1; for (let k = 0; k < 22; k++) { const m = (a + b) / 2; if (.5 * m + .5 * m * m * (3 - 2 * m) < u) a = m; else b = m }
+    PD.push({ x, y, z, th: T0 + (a + b) / 2 * (T1 - T0), vx: (rnd() - .5) * .5 + (top ? 0 : Math.sign(x) * .4), vy: .25 + rnd() * .7, vz: (rnd() - .5) * .5, spark: i % 3 === 0 });
+  }
+  const mkPts = (n, col, size) => { const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(n * 3), 3)); g.setAttribute('color', new THREE.BufferAttribute(new Float32Array(n * 3), 3));
+    const p = new THREE.Points(g, new THREE.PointsMaterial({ size, vertexColors: true, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, sizeAttenuation: true })); p.frustumCulled = false; p.renderOrder = 6; scene.add(p); return p };
+  sparks = mkPts(PD.filter(p => p.spark).length, 0, .05); flakes = mkPts(PD.filter(p => !p.spark).length, 0, .028);
+
+  const onLoad = obj => { try { setupCar(obj.scene || obj); ready = true; $('#ld').style.display = 'none'; setQ(1); $('#st').textContent = `Repainted ${DG.body} of ${DG.mats.length} materials. Others kept: ${DG.kept.join(', ').slice(0, 160)}` } catch (e) { fail(e) } };
+  const ext = MODEL.split('?')[0].split('.').pop().toLowerCase();
+  if (ext === 'glb' || ext === 'gltf') new GLTFLoader().load(MODEL, onLoad, undefined, fail); else new FBXLoader().load(MODEL, onLoad, undefined, fail);
+}
+
+function setupCar(root) {
+  const body = new Map(); DG.body = 0; DG.kept = [];
+  root.traverse(o => {
+    if (!o.isMesh) return;
+    const conv = m => { const k = m.uuid; if (body.has(k)) return body.get(k); let n = m.name || ''; if (!DG.mats.includes(n)) DG.mats.push(n);
+      const r = KEEP.test(n) ? keepMat(m) : bodyMat(m); if (r.isMeshPhysicalMaterial) DG.body++; else if (!DG.kept.includes(n)) DG.kept.push(n); body.set(k, r); return r };
+    o.material = Array.isArray(o.material) ? o.material.map(conv) : conv(o.material); o.frustumCulled = false;
+  });
+  if (!DG.body) { // fallback: nothing matched, repaint everything that is not glass/tyre
+    root.traverse(o => { if (o.isMesh && !/glass|tyre|tire|rubber/i.test((o.material.name || ''))) o.material = bodyMat(o.material) });
+  }
+  console.log('materials:', DG.mats);
+  fbx_normalise(root);
+  carG.add(root); mirG.add(root.clone(true));
+}
+function fbx_normalise(f) {
+  f.updateMatrixWorld(true); let b = new THREE.Box3().setFromObject(f), s = b.getSize(new THREE.Vector3());
+  if (s.x > s.z) { f.rotation.y = Math.PI / 2; f.updateMatrixWorld(true); b.setFromObject(f); b.getSize(s) }
+  f.scale.setScalar(CAR_LENGTH / s.z); f.updateMatrixWorld(true); b.setFromObject(f);
+  const wb = new THREE.Box3(); let n = 0; f.traverse(o => { if (o.isMesh && /spoiler|wing/i.test(o.name)) { wb.expandByObject(o); n++ } });
+  if (n && wb.getCenter(new THREE.Vector3()).z > 0) { f.rotation.y += Math.PI; f.updateMatrixWorld(true); b.setFromObject(f) }   // rear wing must be at -Z
+  if (FLIP_CAR) { f.rotation.y += Math.PI; f.updateMatrixWorld(true); b.setFromObject(f) }
+  f.position.set(-(b.min.x + b.max.x) / 2, -b.min.y, -(b.min.z + b.max.z) / 2); f.updateMatrixWorld(true);
+}
+function setQ(i) { const [w, h] = Q[i]; R.setPixelRatio(1); R.setSize(w, h, false); $('#ql').value = i }
+
+/* ================= camera path (front hemisphere only), Catmull-Rom through keys ================= */
+//        t   azimuth° radius height  tx   ty   tz   fov
+const CK = [[0, -46, 4.8, 2.0, 0, .5, .5, 40], [3.2, -64, 3.3, 1.0, -.2, .45, 1.1, 36], [6.2, -30, 4.4, .75, 0, .5, .2, 36], [9, 2, 5.8, .8, 0, .5, 0, 34], [11.8, 24, 6.4, 1.0, 0, .5, 0, 34], [14, 36, 7.6, 1.4, 0, .5, 0, 34]];
+function cr(t, c) { let i = 0; while (i < CK.length - 2 && t >= CK[i + 1][0]) i++; const a = CK[Math.max(i - 1, 0)][c], b = CK[i][c], e = CK[i + 1][c], d = CK[Math.min(i + 2, CK.length - 1)][c], u = cl((t - CK[i][0]) / (CK[i + 1][0] - CK[i][0]), 0, 1);
+  return .5 * ((2 * b) + (-a + e) * u + (2 * a - 5 * b + 4 * e - d) * u * u + (-a + 3 * b - 3 * e + d) * u * u * u) }
+
+/* ================= render: pure function of time ================= */
+const V = new THREE.Vector3();
+function render(t) {
+  if (!ready) return;
+  const p = prog(t), glow = sstep(4.5, 9.5, t), fz = lerp(U.uZ0.value, U.uZ1.value, p);
+  U.uP.value = p; U.uT.value = t;
+  // camera
+  const az = cr(t, 1) * Math.PI / 180, r = cr(t, 2);
+  cam.position.set(cr(t, 4) + Math.sin(az) * r, cr(t, 3), cr(t, 6) + Math.cos(az) * r); cam.fov = cr(t, 7); cam.updateProjectionMatrix(); cam.lookAt(cr(t, 4), cr(t, 5), cr(t, 6));
+  // red light riding the crack front (only while it is over the car)
+  const onCar = sstep(-3.2, -2.4, fz) * (1 - sstep(2.4, 3.2, fz));
+  redFront.position.set(0, 1.0, clamp(fz, -2.4, 2.4)); redFront.intensity = onCar * 16;
+  redL.intensity = redR.intensity = glow * 14;
+  lightMats.forEach(m => m.emissiveIntensity = m.userData.soft ? glow * .12 : glow * 2.6);
+  floorGlow.material.opacity = glow * .55 + onCar * .25;
+  // flakes + sparks
+  let fi = 0, si = 0; const fp = flakes.geometry.attributes, sp = sparks.geometry.attributes;
+  for (const q of PD) {
+    const age = t - q.th, on = age > 0 && age < 1.5, k = on ? Math.pow(1 - age / 1.5, 1.6) : 0, A = q.spark ? sp : fp, i = q.spark ? si++ : fi++;
+    A.position.setXYZ(i, q.x + q.vx * age, on ? q.y + q.vy * age - .9 * age * age : -50, q.z + q.vz * age);
+    if (q.spark) A.color.setXYZ(i, 1 * k, .22 * k, .08 * k); else A.color.setXYZ(i, .9 * k, .92 * k, 1 * k);
+  }
+  fp.position.needsUpdate = fp.color.needsUpdate = sp.position.needsUpdate = sp.color.needsUpdate = true;
+  R.render(scene, cam);
+  if (recOn || exp) rx.drawImage($('#gl'), 0, 0, rc.width, rc.height);
+  $('#sc').value = t; $('#tm').textContent = fmt(t) + ' / ' + fmt(DUR);
+}
+const clamp = cl;
+function loop(now) { requestAnimationFrame(loop); const dt = Math.min(.1, (now - last) / 1e3); last = now; if (!ready || exp) return; if (playing) { T += dt; if (T >= DUR) { T = DUR; setPlay(false); if (recOn) stopRec() } } render(T) }
+function setPlay(p) { playing = p; $('#pp').textContent = p ? '⏸ Pause' : '▶ Play' }
+
+/* ================= live recording ================= */
+function startRec() {
+  if (exp) return; if (!window.MediaRecorder || !HTMLCanvasElement.prototype.captureStream) { $('#st').textContent = 'MediaRecorder/captureStream unsupported here'; return }
+  const w = +$('#rq').value, h = w * 16 / 9; rc = rc || document.createElement('canvas'); rc.width = w; rc.height = h; rx = rc.getContext('2d'); prevQ = +$('#ql').value; setQ(w > 600 ? 2 : 1);
+  const st = rc.captureStream(30), mt = ['video/mp4;codecs=avc1.42E01E', 'video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'].find(x => MediaRecorder.isTypeSupported(x)); if (!mt) { $('#st').textContent = 'No supported recording format'; return }
+  try { mr = new MediaRecorder(st, { mimeType: mt, videoBitsPerSecond: w > 600 ? 10e6 : 4e6 }) } catch (e) { $('#st').textContent = 'Recorder error: ' + e.message; return }
+  chunks = []; mr.ondataavailable = e => e.data && e.data.size && chunks.push(e.data);
+  mr.onstop = () => { const ext = mt.includes('mp4') ? 'mp4' : 'webm', b = new Blob(chunks, { type: mt }), u = URL.createObjectURL(b), a = document.createElement('a'); a.href = u; a.download = `white-to-carbon-${w}x${h}.${ext}`; document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(u), 8000); $('#st').textContent = `Saved ${ext.toUpperCase()} ${(b.size / 1e6).toFixed(1)} MB`; chunks = []; setQ(prevQ); $('#rec').textContent = '● Record (live)' };
+  recOn = true; T = 0; mr.start(500); setPlay(true); $('#rec').textContent = '■ Stop'; $('#st').textContent = '● Recording…';
+}
+function stopRec() { if (!recOn) return; recOn = false; setPlay(false); if (mr && mr.state !== 'inactive') mr.stop() }
+
+/* ================= offline MP4 export: frame n rendered at exactly t=n/30 (WebCodecs H.264 + mp4-muxer from jsDelivr) ================= */
+async function exportMp4() {
+  const st = m => $('#st').textContent = m; if (exp) { expCancel = true; return } if (recOn) return;
+  if (!window.VideoEncoder || !window.VideoFrame) { st('MP4 export needs WebCodecs (desktop/Android Chrome or Edge). Use ● Record (live).'); return }
+  const W = +$('#rq').value, H = W * 16 / 9, N = DUR * FPS; let M;
+  try { M = await import('https://cdn.jsdelivr.net/npm/mp4-muxer@5.1.3/build/mp4-muxer.mjs') } catch (e) { st('Could not load mp4-muxer (internet needed): ' + e.message); return }
+  let vc = null; for (const codec of ['avc1.640033', 'avc1.64002a', 'avc1.4d0033', 'avc1.42003e']) { const c = { codec, width: W, height: H, bitrate: W > 600 ? 12e6 : 5e6, framerate: FPS }; try { if ((await VideoEncoder.isConfigSupported(c)).supported) { vc = c; break } } catch (e) { } }
+  if (!vc) { st('No H.264 encoder for ' + W + '×' + H + '. Try 540×960 or ● Record (live).'); return }
+  exp = true; expCancel = false; setPlay(false); prevQ = +$('#ql').value; setQ(W > 600 ? 2 : 1); $('#rec').disabled = true; $('#ex').textContent = '■ Cancel export';
+  rc = rc || document.createElement('canvas'); rc.width = W; rc.height = H; rx = rc.getContext('2d');
+  try {
+    let err = null; const mux = new M.Muxer({ target: new M.ArrayBufferTarget(), video: { codec: 'avc', width: W, height: H }, fastStart: 'in-memory' });
+    const ve = new VideoEncoder({ output: (c, m) => mux.addVideoChunk(c, m), error: e => err = e }); ve.configure(vc);
+    for (let n = 0; n < N; n++) {
+      if (expCancel) throw new Error('cancelled'); if (err) throw err;
+      render(n / FPS); const f = new VideoFrame(rc, { timestamp: Math.round(n * 1e6 / FPS), duration: Math.round(1e6 / FPS) }); ve.encode(f, { keyFrame: n % 60 === 0 }); f.close();
+      while (ve.encodeQueueSize > 6) await new Promise(r => setTimeout(r, 2));
+      if (n % 5 === 0) { st(`Exporting ${Math.round(n / N * 100)}% · frame ${n}/${N}`); await new Promise(r => setTimeout(r)) }
+    }
+    await ve.flush(); if (err) throw err; mux.finalize();
+    const b = new Blob([mux.target.buffer], { type: 'video/mp4' }), u = URL.createObjectURL(b), a = document.createElement('a'); a.href = u; a.download = `white-to-carbon-${W}x${H}.mp4`; document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(u), 8000);
+    st(`Saved MP4 ${(b.size / 1e6).toFixed(1)} MB · ${DUR}s · ${FPS}fps · no audio`);
+  } catch (e) { st(e.message === 'cancelled' ? 'Export cancelled' : 'Export failed: ' + e.message); console.error(e) }
+  finally { exp = false; setQ(prevQ); $('#rec').disabled = false; $('#ex').textContent = '⬇ Export MP4' }
+}
+
+/* ================= UI ================= */
+$('#pp').onclick = () => { if (recOn) return; if (T >= DUR) T = 0; setPlay(!playing) };
+$('#rs').onclick = () => { if (recOn) return; T = 0; setPlay(true) };
+$('#sc').oninput = e => { if (!recOn) T = cl(+e.target.value, 0, DUR) };
+$('#ql').onchange = e => { if (!recOn && !exp) setQ(+e.target.value) };
+$('#rec').onclick = () => { if (exp) return; recOn ? stopRec() : startRec() };
+$('#ex').onclick = exportMp4;
+window.__fx = { seek: t => { T = cl(t, 0, DUR) }, DG };
+try { initScene(); requestAnimationFrame(loop) } catch (e) { fail(e) }
+</script></body></html>
